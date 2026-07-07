@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF PNG オーバーレイツール</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ---- ツールバー ---- */
+    #toolbar {
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: #0f3460;
+      color: #eee;
+      border: 1px solid #1a5c9b;
+      border-radius: 6px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    button:hover { background: #1a5c9b; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    .sep { width: 1px; height: 28px; background: #0f3460; margin: 0 4px; }
+
+    #pageLabel { font-size: 13px; min-width: 80px; text-align: center; color: #aac; }
+
+    /* ---- プロパティパネル ---- */
+    #propPanel {
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    #propPanel label { font-size: 12px; color: #aac; }
+
+    #propPanel input[type="number"] {
+      width: 72px;
+      background: #0a1628;
+      border: 1px solid #1a5c9b;
+      border-radius: 4px;
+      color: #eee;
+      padding: 3px 6px;
+      font-size: 13px;
+    }
+
+    #propPanel input[type="checkbox"] { accent-color: #e63; }
+
+    #applyAllLabel { font-size: 12px; color: #fca; cursor: pointer; }
+
+    /* ---- キャンバスエリア ---- */
+    #canvasArea {
+      flex: 1;
+      overflow: auto;
+      background: #888;
+      display: flex;
+      justify-content: flex-start;
+      align-items: flex-start;
+      padding: 16px;
+    }
+
+    #canvasWrap {
+      position: relative;
+      display: inline-block;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.6);
+    }
+
+    #pdfCanvas {
+      display: block;
+    }
+
+    /* PNG オーバーレイ (canvas の上に絶対配置) */
+    #overlayCanvas {
+      position: absolute;
+      top: 0; left: 0;
+      pointer-events: none;
+    }
+
+    /* マウスイベントを受ける透明な当たり判定レイヤー */
+    #hitLayer {
+      position: absolute;
+      top: 0; left: 0;
+      cursor: default;
+    }
+
+    /* ---- ステータスバー ---- */
+    #statusBar {
+      background: #0a1628;
+      border-top: 1px solid #0f3460;
+      padding: 4px 12px;
+      font-size: 12px;
+      color: #aac;
+      flex-shrink: 0;
+    }
+
+    /* ドロップゾーンのハイライト */
+    body.drag-over #canvasArea { outline: 3px dashed #e63; }
+
+    /* ファイル入力は非表示 */
+    input[type="file"] { display: none; }
+  </style>
+</head>
+<body>
+
+<!-- hidden file inputs -->
+<input type="file" id="pdfInput" accept=".pdf">
+<input type="file" id="pngInput" accept="image/*">
+
+<!-- ツールバー -->
+<div id="toolbar">
+  <button id="btnOpenPdf">📄 PDFを開く</button>
+  <button id="btnOpenPng" disabled>🖼 画像を開く</button>
+  <div class="sep"></div>
+  <button id="btnPrev" disabled>◀</button>
+  <span id="pageLabel">—</span>
+  <button id="btnNext" disabled>▶</button>
+  <div class="sep"></div>
+  <button id="btnSave" disabled>💾 保存</button>
+</div>
+
+<!-- プロパティパネル -->
+<div id="propPanel">
+  <label>X (pt):</label>
+  <input type="number" id="inX" value="50" step="0.5">
+  <label>Y (pt):</label>
+  <input type="number" id="inY" value="50" step="0.5">
+  <label>幅 (pt):</label>
+  <input type="number" id="inW" value="100" step="0.5" min="1">
+  <label>高さ (pt):</label>
+  <input type="number" id="inH" value="100" step="0.5" min="1">
+  <div class="sep"></div>
+  <input type="checkbox" id="applyAll">
+  <label id="applyAllLabel" for="applyAll">全ページに適用して保存</label>
+</div>
+
+<!-- キャンバスエリア -->
+<div id="canvasArea">
+  <div id="canvasWrap">
+    <canvas id="pdfCanvas"></canvas>
+    <canvas id="overlayCanvas"></canvas>
+    <canvas id="hitLayer"></canvas>
+  </div>
+</div>
+
+<!-- ステータスバー -->
+<div id="statusBar" id="statusBar">PDFを開いてください</div>
+
+<script>
+// =====================================================================
+// 設定
+// =====================================================================
+const HANDLE_SIZE = 10;  // px (表示スケール済)
+const DISPLAY_SCALE = 1.5;  // PDF → 表示倍率
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+// =====================================================================
+// 状態
+// =====================================================================
+let pdfDoc = null;       // pdf.js PDFDocumentProxy
+let pdfBytes = null;     // ArrayBuffer (保存用)
+let pdfPath = '';        // ファイル名
+let currentPage = 1;
+let totalPages = 0;
+
+let pngImage = null;     // HTMLImageElement
+let pngBytes = null;     // ArrayBuffer (保存用)
+let pngPath = '';
+let pngMime = 'image/png';
+
+// PNG の PDF 座標系での位置・サイズ (pt)
+let pngX = 50, pngY = 50, pngW = 100, pngH = 100;
+
+// ページの PDF サイズ (pt) — ページごとに異なる場合あり
+let pagePtW = 595, pagePtH = 842;
+
+// ドラッグ
+let dragMode = null;  // 'move' | 'resize'
+let dragOX = 0, dragOY = 0;
+
+// =====================================================================
+// DOM 参照
+// =====================================================================
+const pdfCanvas    = document.getElementById('pdfCanvas');
+const overlayCanvas= document.getElementById('overlayCanvas');
+const hitLayer     = document.getElementById('hitLayer');
+const pdfCtx       = pdfCanvas.getContext('2d');
+const ovCtx        = overlayCanvas.getContext('2d');
+
+const inX = document.getElementById('inX');
+const inY = document.getElementById('inY');
+const inW = document.getElementById('inW');
+const inH = document.getElementById('inH');
+
+const pageLabel = document.getElementById('pageLabel');
+const statusBar = document.getElementById('statusBar');
+const btnPrev   = document.getElementById('btnPrev');
+const btnNext   = document.getElementById('btnNext');
+const btnSave   = document.getElementById('btnSave');
+const btnOpenPng= document.getElementById('btnOpenPng');
+
+// =====================================================================
+// ユーティリティ
+// =====================================================================
+function setStatus(msg) { statusBar.textContent = msg; }
+
+function pt2px(v) { return v * DISPLAY_SCALE; }
+function px2pt(v) { return v / DISPLAY_SCALE; }
+
+// PDF座標系: 原点=左下、Y軸上向き → Canvas座標: 原点=左上、Y軸下向き
+// 変換: canvasY = pageH_px - pngY_px - pngH_px
+function ptToCanvas(x, y, w, h) {
+  const pageH_px = pagePtH * DISPLAY_SCALE;
+  return {
+    dx: pt2px(x),
+    dy: pageH_px - pt2px(y) - pt2px(h),
+    dw: pt2px(w),
+    dh: pt2px(h),
+  };
+}
+
+function syncFields() {
+  inX.value = pngX.toFixed(1);
+  inY.value = pngY.toFixed(1);
+  inW.value = pngW.toFixed(1);
+  inH.value = pngH.toFixed(1);
+}
+
+// =====================================================================
+// PDF 表示
+// =====================================================================
+async function renderPage(num) {
+  if (!pdfDoc) return;
+  const page = await pdfDoc.getPage(num);
+  const vp = page.getViewport({ scale: DISPLAY_SCALE });
+
+  pdfCanvas.width  = vp.width;
+  pdfCanvas.height = vp.height;
+  overlayCanvas.width  = vp.width;
+  overlayCanvas.height = vp.height;
+  hitLayer.width   = vp.width;
+  hitLayer.height  = vp.height;
+
+  // PDF サイズを pt 単位で記憶
+  const vpOrig = page.getViewport({ scale: 1 });
+  pagePtW = vpOrig.width;
+  pagePtH = vpOrig.height;
+
+  await page.render({ canvasContext: pdfCtx, viewport: vp }).promise;
+
+  pageLabel.textContent = `  ${num} / ${totalPages}  `;
+  btnPrev.disabled = num <= 1;
+  btnNext.disabled = num >= totalPages;
+
+  drawOverlay();
+}
+
+// =====================================================================
+// PNG オーバーレイ描画
+// =====================================================================
+function drawOverlay() {
+  ovCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  if (!pngImage) return;
+
+  const { dx, dy, dw, dh } = ptToCanvas(pngX, pngY, pngW, pngH);
+
+  ovCtx.drawImage(pngImage, dx, dy, dw, dh);
+
+  // 枠線
+  ovCtx.strokeStyle = '#e63';
+  ovCtx.lineWidth = 2;
+  ovCtx.strokeRect(dx, dy, dw, dh);
+
+  // リサイズハンドル（右下）
+  const hs = HANDLE_SIZE;
+  ovCtx.fillStyle = '#e63';
+  ovCtx.fillRect(dx + dw - hs, dy + dh - hs, hs, hs);
+  ovCtx.strokeStyle = 'white';
+  ovCtx.lineWidth = 1;
+  ovCtx.strokeRect(dx + dw - hs, dy + dh - hs, hs, hs);
+}
+
+// =====================================================================
+// マウスイベント
+// =====================================================================
+function canvasXY(e) {
+  const r = hitLayer.getBoundingClientRect();
+  return { cx: e.clientX - r.left, cy: e.clientY - r.top };
+}
+
+function hitHandle(cx, cy) {
+  const { dx, dy, dw, dh } = ptToCanvas(pngX, pngY, pngW, pngH);
+  const hs = HANDLE_SIZE;
+  return cx >= dx + dw - hs && cx <= dx + dw &&
+         cy >= dy + dh - hs && cy <= dy + dh;
+}
+
+function hitOverlay(cx, cy) {
+  const { dx, dy, dw, dh } = ptToCanvas(pngX, pngY, pngW, pngH);
+  return cx >= dx && cx <= dx + dw && cy >= dy && cy <= dy + dh;
+}
+
+hitLayer.addEventListener('mousemove', e => {
+  if (!pngImage) return;
+  const { cx, cy } = canvasXY(e);
+  if (hitHandle(cx, cy)) hitLayer.style.cursor = 'nwse-resize';
+  else if (hitOverlay(cx, cy)) hitLayer.style.cursor = 'move';
+  else hitLayer.style.cursor = 'default';
+});
+
+hitLayer.addEventListener('mousedown', e => {
+  if (!pngImage) return;
+  const { cx, cy } = canvasXY(e);
+  if (hitHandle(cx, cy)) {
+    dragMode = 'resize';
+    dragOX = cx; dragOY = cy;
+  } else if (hitOverlay(cx, cy)) {
+    dragMode = 'move';
+    const { dx, dy } = ptToCanvas(pngX, pngY, pngW, pngH);
+    dragOX = cx - dx;
+    dragOY = cy - dy;
+  }
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove', e => {
+  if (!dragMode) return;
+  const r = hitLayer.getBoundingClientRect();
+  const cx = e.clientX - r.left;
+  const cy = e.clientY - r.top;
+  const pageH_px = pagePtH * DISPLAY_SCALE;
+
+  if (dragMode === 'move') {
+    const newDx = cx - dragOX;
+    const newDy = cy - dragOY;
+    pngX = px2pt(newDx);
+    // PDF y: 原点=左下
+    pngY = px2pt(pageH_px - newDy - pt2px(pngH));
+  } else if (dragMode === 'resize') {
+    const ddx = cx - dragOX;
+    const ddy = cy - dragOY;
+    pngW = Math.max(5, pngW + px2pt(ddx));
+    pngH = Math.max(5, pngH + px2pt(ddy));
+    // Y を固定してリサイズ（右下ハンドル→PDF座標のY下端が変わる）
+    dragOX = cx; dragOY = cy;
+  }
+
+  syncFields();
+  drawOverlay();
+  setStatus(`PNG  x=${pngX.toFixed(1)}  y=${pngY.toFixed(1)}  幅=${pngW.toFixed(1)}  高さ=${pngH.toFixed(1)}  (pt)`);
+});
+
+window.addEventListener('mouseup', () => { dragMode = null; });
+
+// フィールド変更
+[inX, inY, inW, inH].forEach(inp => {
+  inp.addEventListener('change', () => {
+    pngX = parseFloat(inX.value) || 0;
+    pngY = parseFloat(inY.value) || 0;
+    pngW = Math.max(1, parseFloat(inW.value) || 1);
+    pngH = Math.max(1, parseFloat(inH.value) || 1);
+    drawOverlay();
+  });
+});
+
+// =====================================================================
+// ファイル読み込み
+// =====================================================================
+document.getElementById('btnOpenPdf').addEventListener('click', () => {
+  document.getElementById('pdfInput').click();
+});
+document.getElementById('pdfInput').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  pdfPath = file.name;
+  pdfBytes = await file.arrayBuffer();
+  pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes.slice() }).promise;
+  totalPages = pdfDoc.numPages;
+  currentPage = 1;
+  await renderPage(currentPage);
+  btnOpenPng.disabled = false;
+  btnSave.disabled = !pngImage;
+  setStatus(`PDF: ${pdfPath}  (${totalPages} ページ)`);
+  e.target.value = '';
+});
+
+btnOpenPng.addEventListener('click', () => {
+  document.getElementById('pngInput').click();
+});
+document.getElementById('pngInput').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  pngPath = file.name;
+  pngMime = file.type || 'image/png';
+  pngBytes = await file.arrayBuffer();
+
+  const url = URL.createObjectURL(file);
+  pngImage = new Image();
+  pngImage.onload = () => {
+    // デフォルトサイズ: ページ幅の1/5
+    pngW = pagePtW / 5;
+    pngH = pngImage.naturalHeight * (pngW / pngImage.naturalWidth);
+    syncFields();
+    drawOverlay();
+    btnSave.disabled = !pdfDoc;
+    setStatus(`画像: ${pngPath}  (元サイズ ${pngImage.naturalWidth}×${pngImage.naturalHeight}px)`);
+    URL.revokeObjectURL(url);
+  };
+  pngImage.src = url;
+  e.target.value = '';
+});
+
+// =====================================================================
+// ページナビゲーション
+// =====================================================================
+btnPrev.addEventListener('click', async () => {
+  if (currentPage > 1) { currentPage--; await renderPage(currentPage); }
+});
+btnNext.addEventListener('click', async () => {
+  if (currentPage < totalPages) { currentPage++; await renderPage(currentPage); }
+});
+
+// =====================================================================
+// 保存 (pdf-lib)
+// =====================================================================
+document.getElementById('btnSave').addEventListener('click', async () => {
+  if (!pdfDoc || !pngImage) return;
+  setStatus('保存中...');
+  try {
+    const applyAll = document.getElementById('applyAll').checked;
+    const pages = applyAll ? [...Array(totalPages).keys()].map(i => i + 1) : [currentPage];
+
+    const lib = PDFLib;
+    const pdfLibDoc = await lib.PDFDocument.load(pdfBytes.slice());
+
+    // 画像を埋め込む
+    let embeddedImg;
+    if (pngMime === 'image/jpeg' || pngMime === 'image/jpg') {
+      embeddedImg = await pdfLibDoc.embedJpg(pngBytes.slice());
+    } else {
+      embeddedImg = await pdfLibDoc.embedPng(pngBytes.slice());
+    }
+
+    for (const pn of pages) {
+      const page = pdfLibDoc.getPage(pn - 1);
+      const { height: ph } = page.getSize();
+      // pdf-lib の座標: 原点=左下、Y軸上向き (PDF標準と同じ)
+      page.drawImage(embeddedImg, {
+        x: pngX,
+        y: pngY,
+        width: pngW,
+        height: pngH,
+      });
+    }
+
+    const outBytes = await pdfLibDoc.save();
+    const blob = new Blob([outBytes], { type: 'application/pdf' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'overlay_' + pdfPath;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus(`保存完了: overlay_${pdfPath}`);
+  } catch (err) {
+    console.error(err);
+    setStatus('エラー: ' + err.message);
+    alert('保存に失敗しました:\n' + err.message);
+  }
+});
+
+// =====================================================================
+// ドラッグ&ドロップ (PDF / 画像)
+// =====================================================================
+document.body.addEventListener('dragover', e => {
+  e.preventDefault();
+  document.body.classList.add('drag-over');
+});
+document.body.addEventListener('dragleave', () => {
+  document.body.classList.remove('drag-over');
+});
+document.body.addEventListener('drop', async e => {
+  e.preventDefault();
+  document.body.classList.remove('drag-over');
+  const files = [...e.dataTransfer.files];
+  for (const f of files) {
+    if (f.type === 'application/pdf' || f.name.endsWith('.pdf')) {
+      pdfPath = f.name;
+      pdfBytes = await f.arrayBuffer();
+      pdfDoc = await pdfjsLib.getDocument({ data: pdfBytes.slice() }).promise;
+      totalPages = pdfDoc.numPages;
+      currentPage = 1;
+      await renderPage(currentPage);
+      btnOpenPng.disabled = false;
+      btnSave.disabled = !pngImage;
+      setStatus(`PDF: ${pdfPath}  (${totalPages} ページ)`);
+    } else if (f.type.startsWith('image/')) {
+      if (!pdfDoc) { setStatus('先にPDFを開いてください'); continue; }
+      pngPath = f.name;
+      pngMime = f.type;
+      pngBytes = await f.arrayBuffer();
+      const url = URL.createObjectURL(f);
+      pngImage = new Image();
+      pngImage.onload = () => {
+        pngW = pagePtW / 5;
+        pngH = pngImage.naturalHeight * (pngW / pngImage.naturalWidth);
+        syncFields();
+        drawOverlay();
+        btnSave.disabled = false;
+        setStatus(`画像: ${pngPath}  (元サイズ ${pngImage.naturalWidth}×${pngImage.naturalHeight}px)`);
+        URL.revokeObjectURL(url);
+      };
+      pngImage.src = url;
+    }
+  }
+});
+</script>
+</body>
+</html>
